@@ -113,6 +113,9 @@ func (s *Server) Run() {
 				delete(s.clients, client)
 				if room, ok := s.rooms[client.GetRoom()]; ok {
 					delete(room.clients, client)
+					if len(room.clients) == 0 && room.name != "大厅" {
+						delete(s.rooms, room.name)
+					}
 				}
 				close(client.GetMessages())
 				s.mu.Unlock()
@@ -226,6 +229,9 @@ func (s *Server) wsReadPump(c *WSClient) {
 			s.mu.Lock()
 			if oldRoom, ok := s.rooms[c.room]; ok {
 				delete(oldRoom.clients, c)
+				if len(oldRoom.clients) == 0 && oldRoom.name != "大厅" {
+					delete(s.rooms, oldRoom.name)
+				}
 			}
 			newR := s.getOrCreateRoom(newRoom)
 			newR.clients[c] = true
@@ -355,6 +361,9 @@ func (s *Server) tcpReadPump(tc *TCPClient) {
 			s.mu.Lock()
 			if oldRoom, ok := s.rooms[tc.room]; ok {
 				delete(oldRoom.clients, tc)
+				if len(oldRoom.clients) == 0 && oldRoom.name != "大厅" {
+					delete(s.rooms, oldRoom.name)
+				}
 			}
 			newR := s.getOrCreateRoom(newRoom)
 			newR.clients[tc] = true
