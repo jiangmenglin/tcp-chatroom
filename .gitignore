@@ -8,3 +8,5 @@
 *.syso
 go.sum
 .DS_Store
+.claude/
+gui_client.exe.manifest
