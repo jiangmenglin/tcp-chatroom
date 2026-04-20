@@ -11,7 +11,7 @@ import (
 )
 
 var (
-	serverAddr = "localhost:8080"
+	serverAddr = "localhost:8081"
 	name      string
 )
 

@@ -1,25 +1,55 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"html/template"
 	"log"
+	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
 	"nhooyr.io/websocket"
 )
 
-var addr = ":8080"
+var (
+	addr     = ":8080"
+	tcpAddr  = ":8081"
+)
 
-type Client struct {
+type Client interface {
+	GetName() string
+	GetRoom() string
+	SetRoom(string)
+	GetMessages() chan string
+}
+
+type WSClient struct {
 	conn     *websocket.Conn
 	name     string
 	messages chan string
 	room     string
 }
+
+func (c *WSClient) GetName() string    { return c.name }
+func (c *WSClient) GetRoom() string     { return c.room }
+func (c *WSClient) SetRoom(r string)    { c.room = r }
+func (c *WSClient) GetMessages() chan string { return c.messages }
+
+type TCPClient struct {
+	conn     net.Conn
+	name     string
+	messages chan string
+	room     string
+}
+
+func (c *TCPClient) GetName() string    { return c.name }
+func (c *TCPClient) GetRoom() string     { return c.room }
+func (c *TCPClient) SetRoom(r string)    { c.room = r }
+func (c *TCPClient) GetMessages() chan string { return c.messages }
 
 type Message struct {
 	content   string
@@ -30,25 +60,25 @@ type Message struct {
 
 type Room struct {
 	name    string
-	clients map[*Client]bool
+	clients map[Client]bool
 }
 
 type Server struct {
-	clients    map[*Client]bool
+	clients    map[Client]bool
 	rooms      map[string]*Room
 	broadcast  chan *Message
-	register   chan *Client
-	unregister chan *Client
+	register   chan Client
+	unregister chan Client
 	mu         sync.Mutex
 }
 
 func NewServer() *Server {
 	return &Server{
-		clients:    make(map[*Client]bool),
+		clients:    make(map[Client]bool),
 		rooms:      make(map[string]*Room),
 		broadcast:  make(chan *Message, 100),
-		register:   make(chan *Client),
-		unregister: make(chan *Client),
+		register:   make(chan Client),
+		unregister: make(chan Client),
 	}
 }
 
@@ -61,7 +91,7 @@ func (s *Server) getOrCreateRoom(name string) *Room {
 	if room, ok := s.rooms[name]; ok {
 		return room
 	}
-	room := &Room{name: name, clients: make(map[*Client]bool)}
+	room := &Room{name: name, clients: make(map[Client]bool)}
 	s.rooms[name] = room
 	return room
 }
@@ -74,19 +104,19 @@ func (s *Server) Run() {
 			s.clients[client] = true
 			count := len(s.clients)
 			s.mu.Unlock()
-			client.messages <- fmt.Sprintf("欢迎 %s 加入聊天室！当前在线人数: %d\n", client.name, count)
-			s.broadcast <- &Message{content: fmt.Sprintf("%s 加入了聊天室", client.name), sender: "系统", roomName: client.room, timestamp: time.Now().Format("15:04:05")}
+			client.GetMessages() <- fmt.Sprintf("欢迎 %s 加入聊天室！当前在线人数: %d\n", client.GetName(), count)
+			s.broadcast <- &Message{content: fmt.Sprintf("%s 加入了聊天室", client.GetName()), sender: "系统", roomName: client.GetRoom(), timestamp: time.Now().Format("15:04:05")}
 
 		case client := <-s.unregister:
 			s.mu.Lock()
 			if _, ok := s.clients[client]; ok {
 				delete(s.clients, client)
-				if room, ok := s.rooms[client.room]; ok {
+				if room, ok := s.rooms[client.GetRoom()]; ok {
 					delete(room.clients, client)
 				}
-				close(client.messages)
+				close(client.GetMessages())
 				s.mu.Unlock()
-				s.broadcast <- &Message{content: fmt.Sprintf("%s 离开了聊天室", client.name), sender: "系统", roomName: client.room, timestamp: time.Now().Format("15:04:05")}
+				s.broadcast <- &Message{content: fmt.Sprintf("%s 离开了聊天室", client.GetName()), sender: "系统", roomName: client.GetRoom(), timestamp: time.Now().Format("15:04:05")}
 			} else {
 				s.mu.Unlock()
 			}
@@ -97,7 +127,7 @@ func (s *Server) Run() {
 			if room != nil {
 				for client := range room.clients {
 					select {
-					case client.messages <- formatMessage(msg):
+					case client.GetMessages() <- formatMessage(msg):
 					default:
 					}
 				}
@@ -114,9 +144,9 @@ func formatMessage(msg *Message) string {
 	return fmt.Sprintf("[%s] %s: %s\n", msg.timestamp, msg.sender, msg.content)
 }
 
-func (s *Server) sendTo(client *Client, msg string) {
+func (s *Server) sendTo(client Client, msg string) {
 	select {
-	case client.messages <- msg:
+	case client.GetMessages() <- msg:
 	default:
 	}
 }
@@ -129,7 +159,7 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}
 	defer conn.Close(websocket.StatusNormalClosure, "")
 
-	client := &Client{
+	client := &WSClient{
 		conn:     conn,
 		name:     "游客",
 		messages: make(chan string, 50),
@@ -147,11 +177,11 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	s.register <- client
 
-	go s.writePump(client)
-	s.readPump(client)
+	go s.wsWritePump(client)
+	s.wsReadPump(client)
 }
 
-func (c *Client) waitForName() string {
+func (c *WSClient) waitForName() string {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	_, msg, err := c.conn.Read(ctx)
@@ -161,7 +191,7 @@ func (c *Client) waitForName() string {
 	return string(msg)
 }
 
-func (s *Server) readPump(c *Client) {
+func (s *Server) wsReadPump(c *WSClient) {
 	defer func() {
 		s.unregister <- c
 	}()
@@ -177,7 +207,7 @@ func (s *Server) readPump(c *Client) {
 			s.mu.Lock()
 			c.messages <- fmt.Sprintf("在线用户 (%d):\n", len(s.clients))
 			for cl := range s.clients {
-				c.messages <- fmt.Sprintf("- %s\n", cl.name)
+				c.messages <- fmt.Sprintf("- %s\n", cl.GetName())
 			}
 			s.mu.Unlock()
 			continue
@@ -211,10 +241,10 @@ func (s *Server) readPump(c *Client) {
 				privateMsg := parts[2]
 				s.mu.Lock()
 				for cl := range s.clients {
-					if cl.name == targetName {
+					if cl.GetName() == targetName {
 						timestamp := time.Now().Format("15:04:05")
 						select {
-						case cl.messages <- fmt.Sprintf("[%s] [%s] 私聊: %s\n", timestamp, c.name, privateMsg):
+						case cl.GetMessages() <- fmt.Sprintf("[%s] [%s] 私聊: %s\n", timestamp, c.name, privateMsg):
 						default:
 						}
 					}
@@ -230,10 +260,141 @@ func (s *Server) readPump(c *Client) {
 	}
 }
 
-func (s *Server) writePump(c *Client) {
+func (s *Server) wsWritePump(c *WSClient) {
 	ctx := context.Background()
 	for msg := range c.messages {
 		err := c.conn.Write(ctx, websocket.MessageText, []byte(msg))
+		if err != nil {
+			return
+		}
+	}
+}
+
+// --- TCP handler ---
+
+func (s *Server) handleTCPConn(conn net.Conn) {
+	defer conn.Close()
+
+	reader := bufio.NewReader(conn)
+	fmt.Fprintln(conn, "请输入你的昵称: ")
+	nameBytes, err := reader.ReadString('\n')
+	if err != nil {
+		return
+	}
+	name := strings.TrimSpace(nameBytes)
+	if name == "" {
+		name = "游客"
+	}
+	if len(name) > 20 {
+		name = name[:20]
+	}
+
+	tc := &TCPClient{
+		conn:     conn,
+		name:     name,
+		messages: make(chan string, 50),
+		room:     "大厅",
+	}
+
+	room := s.getOrCreateRoom("大厅")
+	s.mu.Lock()
+	room.clients[tc] = true
+	s.mu.Unlock()
+
+	s.register <- tc
+
+	go s.tcpWritePump(tc)
+	s.tcpReadPump(tc)
+}
+
+func (s *Server) tcpReadPump(tc *TCPClient) {
+	defer func() {
+		s.mu.Lock()
+		delete(s.clients, tc)
+		if room, ok := s.rooms[tc.room]; ok {
+			delete(room.clients, tc)
+		}
+		s.mu.Unlock()
+		close(tc.messages)
+		s.unregister <- tc
+	}()
+
+	reader := bufio.NewReader(tc.conn)
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			return
+		}
+		text := strings.TrimSpace(line)
+		if text == "" {
+			continue
+		}
+		if text == "/users" {
+			s.mu.Lock()
+			tc.messages <- fmt.Sprintf("在线用户 (%d):\n", len(s.clients))
+			for cl := range s.clients {
+				tc.messages <- fmt.Sprintf("- %s\n", cl.GetName())
+			}
+			s.mu.Unlock()
+			continue
+		}
+		if text == "/rooms" {
+			s.mu.Lock()
+			tc.messages <- fmt.Sprintf("房间 (%d):\n", len(s.rooms))
+			for name, room := range s.rooms {
+				tc.messages <- fmt.Sprintf("- %s (%d人)\n", name, len(room.clients))
+			}
+			s.mu.Unlock()
+			continue
+		}
+		if strings.HasPrefix(text, "/join ") {
+			newRoom := strings.TrimSpace(text[6:])
+			if newRoom == "" {
+				continue
+			}
+			s.mu.Lock()
+			if oldRoom, ok := s.rooms[tc.room]; ok {
+				delete(oldRoom.clients, tc)
+			}
+			newR := s.getOrCreateRoom(newRoom)
+			newR.clients[tc] = true
+			tc.room = newRoom
+			s.mu.Unlock()
+			tc.messages <- fmt.Sprintf("已切换到房间: %s\n", newRoom)
+			continue
+		}
+		if strings.HasPrefix(text, "/msg ") {
+			parts := splitN(text, " ", 3)
+			if len(parts) >= 3 {
+				targetName := parts[1]
+				privateMsg := parts[2]
+				s.mu.Lock()
+				for cl := range s.clients {
+					if cl.GetName() == targetName {
+						timestamp := time.Now().Format("15:04:05")
+						select {
+						case cl.GetMessages() <- fmt.Sprintf("[%s] [%s] 私聊: %s\n", timestamp, tc.name, privateMsg):
+						default:
+						}
+					}
+				}
+				s.mu.Unlock()
+			}
+			continue
+		}
+		if text == "/quit" {
+			return
+		}
+		if text == "/ping" {
+			continue
+		}
+		s.broadcast <- &Message{content: text, sender: tc.name, roomName: tc.room, timestamp: time.Now().Format("15:04:05")}
+	}
+}
+
+func (s *Server) tcpWritePump(tc *TCPClient) {
+	for msg := range tc.messages {
+		_, err := fmt.Fprint(tc.conn, msg)
 		if err != nil {
 			return
 		}
@@ -440,11 +601,32 @@ func main() {
 		server.handleWebSocket(w, r)
 	})
 
+	go func() {
+		fmt.Println("HTTP/WebSocket 服务器启动: http://localhost" + addr)
+		log.Fatal(http.ListenAndServe(addr, nil))
+	}()
+
+	go func() {
+		l, err := net.Listen("tcp", tcpAddr)
+		if err != nil {
+			log.Fatal(err)
+		}
+		fmt.Println("TCP 服务器启动: localhost" + tcpAddr)
+		for {
+			conn, err := l.Accept()
+			if err != nil {
+				log.Println("accept error:", err)
+				continue
+			}
+			go server.handleTCPConn(conn)
+		}
+	}()
+
 	fmt.Println("========================================")
-	fmt.Println("  TCP 聊天室服务器已启动")
-	fmt.Println("  监听地址: localhost" + addr)
-	fmt.Println("  访问: http://localhost" + addr)
+	fmt.Println("  聊天室服务器已启动")
+	fmt.Println("  HTTP/WebSocket: http://localhost" + addr)
+	fmt.Println("  TCP: localhost" + tcpAddr)
 	fmt.Println("========================================")
 
-	log.Fatal(http.ListenAndServe(addr, nil))
+	select {}
 }
